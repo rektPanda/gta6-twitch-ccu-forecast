@@ -34,9 +34,13 @@ persistence shape (spread 0.15 * sqrt(h-1) in log space).
 
 Practice (four past launches, scored with the same pinball loss on the log
 scale as the final): mean loss 0.171 vs the house baseline's 0.387;
-leave-one-launch-out over the comparable regime: 0.243. The model uses
-only the case file: no network, no wall clock, no randomness, so two runs
-produce byte-identical output.
+leave-one-launch-out over the comparable regime: 0.242. Each hour's
+centre, slope and spread are lightly smoothed across neighbouring hours
+(the launch-day shape is smooth in h; per-hour fits are noisy), and every
+output row goes through one cleaning step that enforces the contest's
+bounds, so no path — fitted or fallback — can emit an out-of-range
+quantile. The model uses only the case file: no network, no wall clock,
+no randomness, so two runs produce byte-identical output.
 
 How the grader runs it: `python3 -P -s /bot/main.py` in python:3.13-slim,
 standard library only. It reads every <id>.in in the input directory and
@@ -166,23 +170,16 @@ def fit_hour(pairs: list) -> tuple:
     return (centre, slope, spread, mean_x, min(xs), max(xs))
 
 
-def hour_quantiles(p1: float, hour: int, fit: tuple | None) -> list:
-    """The five quantiles for one hour: the fitted shape, or the house
-    persistence shape when the hour had too few usable comparables."""
-    if fit is None:
-        return [
-            round2(p1 * math.exp(z * BASELINE_SIGMA * math.sqrt(hour - 1)))
-            for z in Z
-        ]
-    centre, slope, spread, mean_x, low_x, high_x = fit
-    ln_p1 = math.log(p1)
-    # Never extrapolate the size slope past the biggest or smallest
-    # launch the fit was trained on.
-    ln_p1 = max(low_x, min(high_x, ln_p1))
-    median = centre + slope * (ln_p1 - mean_x)
+def clean_quantiles(values: list) -> list:
+    """Raw quantile values as one valid output row: capped at the
+    contest's 1e9 ceiling, floored at 0.01, rounded like the grader's
+    JavaScript, and forced non-decreasing. Both the fitted branch and
+    the fallback branch go through this, so no path can emit an
+    out-of-range quantile: the fallback used to cap nothing, and a huge
+    hour-1 print with no usable comparables produced q95 above 1e9
+    (an entry with any invalid case takes no prize)."""
     out = []
-    for z in Z:
-        value = p1 * math.exp(median + z * spread)
+    for value in values:
         value = min(value, 1_000_000_000)
         value = max(value, 0.01)
         out.append(round2(value))
@@ -192,6 +189,61 @@ def hour_quantiles(p1: float, hour: int, fit: tuple | None) -> list:
         if out[i] < out[i - 1]:
             out[i] = out[i - 1]
     return out
+
+
+def hour_quantiles(p1: float, hour: int, fit: tuple | None) -> list:
+    """The five quantiles for one hour: the fitted shape, or the house
+    persistence shape when the hour had too few usable comparables."""
+    if fit is None:
+        return clean_quantiles(
+            [p1 * math.exp(z * BASELINE_SIGMA * math.sqrt(hour - 1)) for z in Z]
+        )
+    centre, slope, spread, mean_x, low_x, high_x = fit
+    ln_p1 = math.log(p1)
+    # Never extrapolate the size slope past the biggest or smallest
+    # launch the fit was trained on.
+    ln_p1 = max(low_x, min(high_x, ln_p1))
+    median = centre + slope * (ln_p1 - mean_x)
+    return clean_quantiles(
+        [p1 * math.exp(median + z * spread) for z in Z]
+    )
+
+
+def smooth_fits(fits: dict) -> dict:
+    """Lightly smooth each fitted hour's centre, slope and spread
+    across its neighbouring hours.
+
+    The true launch-day shape is smooth in h, but every hour is fitted
+    independently from ~19 launches, so each hour's parameters carry
+    independent estimation noise. A [0.25, 0.5, 0.25] kernel over h-1,
+    h, h+1 pools that noise out without blurring the shape (the fitted
+    centres rise smoothly already). Hours without a fit stay without
+    one, and a fitted hour whose neighbours have no fit is left alone.
+    Measured on the calibration set: LOOCV 0.242 (was 0.243), practice
+    0.171 (was 0.171) — no harm on either criterion, and less
+    hour-to-hour jitter in the forecast."""
+    kernel = (0.25, 0.5, 0.25)
+    offsets = (-1, 0, 1)
+    smoothed = {}
+    for hour, fit in fits.items():
+        if fit is None:
+            smoothed[hour] = None
+            continue
+        centre, slope, spread, mean_x, low_x, high_x = fit
+        params = []
+        for index, value in enumerate((centre, slope, spread)):
+            numerator = 0.0
+            denominator = 0.0
+            for offset, weight in zip(offsets, kernel):
+                neighbour = fits.get(hour + offset)
+                if neighbour is not None:
+                    numerator += weight * neighbour[index]
+                    denominator += weight
+            params.append(numerator / denominator if denominator else value)
+        smoothed[hour] = (
+            params[0], params[1], params[2], mean_x, low_x, high_x,
+        )
+    return smoothed
 
 
 def forecast_case(case: dict, name: str) -> dict:
@@ -222,6 +274,7 @@ def forecast_case(case: dict, name: str) -> dict:
                 continue
             pairs.append((math.log(hour1), math.log(value / hour1)))
         fits[hour] = fit_hour(pairs) if len(pairs) >= MIN_FIT else None
+    fits = smooth_fits(fits)
 
     return {
         "hours": [
